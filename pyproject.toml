@@ -1,0 +1,26 @@
+[project]
+name = "agenticfastlyguard"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=5.1.0",
+    "dotenv>=0.9.9",
+    "faiss-cpu>=1.15.1",
+    "langchain>=1.4.6",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.11",
+    "langchain-huggingface>=1.2.3",
+    "langchain-openai>=1.7.2",
+    "langchain-text-splitters>=1.1.3",
+    "langgraph>=1.2.15",
+    "qdrant-client>=1.19.1",
+    "sentence-transformers>=6.1.0",
+    "streamlit>=1.66.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

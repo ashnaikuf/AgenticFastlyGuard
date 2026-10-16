@@ -272,19 +272,8 @@ def main():
                     st.warning("No YAML condition definition returned.")
 
                 # Final Agent Structured JSON Output (matching main.py CLI output)
-                st.markdown("### Final Agent Structured JSON Output")
-                st.json(result)
-
-                # CLI Console Format
-                st.markdown("#### Exact CLI Format (Matching `main.py`)")
-                cli_output = (
-                    "=" * 80 + "\n"
-                    "FINAL AGENT STRUCTURED JSON OUTPUT:\n"
-                    "=" * 80 + "\n"
-                    f"{json.dumps(result, indent=2)}\n"
-                    "=" * 80
-                )
-                st.code(cli_output, language="text")
+                # st.markdown("### Final Agent Structured JSON Output")
+                # st.json(result)
 
             except Exception as e:
                 logger.exception("Error executing WAF agent pipeline: %s", e)
