@@ -20,7 +20,7 @@ logger = logging.getLogger("main")
 
 
 def main():
-    CSV_FILE = "requests_sqli_xss_cmdexe.csv"
+    CSV_FILE = "requests_maliciousip.csv"
     RULES_DIR = "rules"
 
     logger.info("Step 1: Ingesting and vector indexing WAF rules from %s/...", RULES_DIR)

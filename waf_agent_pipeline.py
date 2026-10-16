@@ -411,29 +411,113 @@ def delete_orphaned_rule_points(
 # Step 2: CSV Signal Extraction
 # ==============================================================================
 
+# --- IP threat signal support (RULE-001) -------------------------------------
+# Canonical IP reputation / blocklist signal tags that route to RULE-001.
+IP_THREAT_SIGNALS = {
+    "SITE-FLAGGED-IP",
+    "SIGSCI-IP",
+    "MALICIOUS-IP",
+    "BLOCKLISTED-IP",
+}
+
+# Attack-specific signals that must keep taking precedence over RULE-001, so an
+# IP-flagged request carrying a real payload still reports the attack rule.
+ATTACK_SIGNALS = {
+    "XSS",
+    "SQLI",
+    "TRAVERSAL",
+    "CMDEXE",
+    "CODEINJECTION",
+    "ATTACK-TOOLING",
+    "DOUBLEENCODING",
+    "ABNORMALPATH",
+}
+
+# Signals that carry no routing information on their own.
+GENERIC_SIGNALS = {"BLOCKED", "BOT-ANALYSIS"}
+
+
+def normalize_signal_id(raw: Any) -> str:
+    """Normalize a raw signal ID to the canonical upper/hyphenated spelling.
+
+    Fastly writes IP signals as ``SITE-FLAGGED-IP``/``SIGSCI-IP`` in logs but as
+    ``SigSci IP``/``Malicious IP`` in rule YAML; normalizing both sides lets them
+    compare equal.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[\s_]+", "-", text).upper()
+
+
+def is_ip_threat_signal(signal: Any) -> bool:
+    """True when a signal denotes an IP reputation / blocklist threat (RULE-001)."""
+    return normalize_signal_id(signal) in IP_THREAT_SIGNALS
+
+
+def _summation_marks_blocklisted_ip(summation: Any) -> bool:
+    """True when the `summation` column reports the client IP as blocklisted."""
+    if not isinstance(summation, str) or not summation.strip():
+        return False
+    # Match "blocklisted":"true" / "blocklisted": true, case-insensitively.
+    return bool(re.search(r'"blocklisted"\s*:\s*"?true"?', summation, re.IGNORECASE))
+
+
+def _extract_row_signals(signals_raw: Any, summation_raw: Any = None) -> List[str]:
+    """Parse one row's `signals` JSON, normalizing IP tags and de-duplicating.
+
+    Existing attack signal IDs (XSS, SQLI, ...) are preserved verbatim so that
+    current OWASP and path-based rule evaluation is unaffected.
+    """
+    row_signals: List[str] = []
+    if pd.notna(signals_raw) and isinstance(signals_raw, str) and signals_raw.strip():
+        try:
+            parsed = json.loads(signals_raw)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and item.get("id"):
+                        signal_id = item["id"]
+                        # NEW: normalize IP-related IDs to canonical tags; all
+                        # other signal IDs keep their original spelling.
+                        if is_ip_threat_signal(signal_id):
+                            signal_id = normalize_signal_id(signal_id)
+                        if signal_id not in row_signals:
+                            row_signals.append(signal_id)
+        except Exception as err:
+            logger.debug("Failed parsing signals JSON: %s", err)
+
+    # NEW: fall back to the `summation` blocklist flag only when the row carries
+    # no explicit IP signal. `"blocklisted":"true"` is set on effectively every
+    # logged request, so appending it unconditionally would mark all traffic as
+    # an IP threat and starve the attack-specific rules.
+    if not any(is_ip_threat_signal(s) for s in row_signals):
+        if _summation_marks_blocklisted_ip(summation_raw):
+            row_signals.append("BLOCKLISTED-IP")
+
+    return row_signals
+
+
 def extract_signals_from_csv(csv_path: str) -> List[List[str]]:
     """Read the incoming CSV file using pandas and extract signal IDs for each row.
 
     The CSV contains a `signals` column with JSON strings like:
     `[{"id":"XSS","location":"QUERYSTRING",...}]`
 
+    IP threat tags (`SITE-FLAGGED-IP`, `SIGSCI-IP`) are normalized to their
+    canonical spelling, and the `summation` column is inspected for a
+    `"blocklisted":"true"` flag as a fallback IP threat indicator.
+
     Returns a list of detected signal IDs for each row.
     """
     df = pd.read_csv(csv_path)
     all_signals: List[List[str]] = []
 
-    for val in df.get("signals", []):
-        row_signals: List[str] = []
-        if pd.notna(val) and isinstance(val, str) and val.strip():
-            try:
-                parsed = json.loads(val)
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and "id" in item and item["id"]:
-                            row_signals.append(item["id"])
-            except Exception as err:
-                logger.debug("Failed parsing signals JSON: %s", err)
-        all_signals.append(row_signals)
+    # NEW: read `summation` alongside `signals` so the blocklist flag is available.
+    summations = df["summation"] if "summation" in df.columns else None
+
+    for position, val in enumerate(df.get("signals", [])):
+        summation_raw = summations.iloc[position] if summations is not None else None
+        all_signals.append(_extract_row_signals(val, summation_raw))
 
     return all_signals
 
@@ -456,16 +540,10 @@ def extract_log_context(state: WAFState) -> Dict[str, Any]:
 
     row = df.iloc[row_index]
 
-    # Parse signals for this row
-    signals_raw = row.get("signals")
-    signals: List[str] = []
-    if pd.notna(signals_raw) and isinstance(signals_raw, str):
-        try:
-            parsed = json.loads(signals_raw)
-            if isinstance(parsed, list):
-                signals = [item["id"] for item in parsed if isinstance(item, dict) and "id" in item]
-        except Exception:
-            pass
+    # Parse signals for this row. NEW: shares `_extract_row_signals` with
+    # extract_signals_from_csv so IP tag normalization and the `summation`
+    # blocklist fallback apply identically here.
+    signals = _extract_row_signals(row.get("signals"), row.get("summation"))
 
     domain = (
         str(row.get("server_name") or row.get("server_hostname") or "")
@@ -481,6 +559,8 @@ def extract_log_context(state: WAFState) -> Dict[str, Any]:
         "method": method,
         "uri": uri,
         "row_index": row_index,
+        # NEW: IP threat signals surfaced for RULE-001 routing downstream.
+        "ip_threat_signals": [s for s in signals if is_ip_threat_signal(s)],
     }
 
     return {"log_context": log_context}
@@ -496,11 +576,19 @@ def retrieve_waf_rules(state: WAFState) -> Dict[str, Any]:
     if vectorstore is None:
         vectorstore = build_waf_rule_vectorstore()
 
-    # Form query string from detected signals and request path
-    query_terms = [s for s in signals if s not in {"BLOCKED", "BOT-ANALYSIS", "SITE-FLAGGED-IP"}]
+    # Form query string from detected signals and request path.
+    # NEW: IP threat tags are no longer stripped here (SITE-FLAGGED-IP used to be
+    # discarded), so an IP-only request can still retrieve RULE-001.
+    query_terms = [s for s in signals if normalize_signal_id(s) not in GENERIC_SIGNALS]
     if not query_terms:
         query_terms = signals
+
+    ip_threat_signals = [s for s in signals if is_ip_threat_signal(s)]
     query_str = f"Signals: {' '.join(query_terms)} Path: {path}"
+    if ip_threat_signals:
+        # NEW: add natural-language IP reputation terms so RULE-001's description
+        # ("malicious IP", "reputation", "blocklist") scores well semantically.
+        query_str += " Malicious IP reputation blocklist flagged client address"
 
     # Query vector store with metadata filter for action: BLOCK
     collection_name = os.getenv("QDRANT_COLLECTION_NAME", "fastly_wafrules")
@@ -547,8 +635,16 @@ def _deterministic_evaluate_rule(
     """
     signals = log_context.get("signals", [])
     signals_lower_map = {s.lower(): s for s in signals}
+    # NEW: normalized lookup so rule YAML spellings ("SigSci IP", "Malicious IP")
+    # match the log's canonical tags ("SIGSCI-IP", "MALICIOUS-IP").
+    signals_normalized_map = {normalize_signal_id(s): s for s in signals}
     path = log_context.get("path", "")
     domain = log_context.get("domain", "")
+
+    # NEW: IP threat detection for RULE-001. Evaluated only after the
+    # attack-specific rules below, so a blocklisted IP that also carries an XSS
+    # or SQLi payload still reports the attack rule.
+    ip_threat_detected = [s for s in signals if is_ip_threat_signal(s)]
 
     for rule in retrieved_rules:
         rule_id = rule.get("rule_id")
@@ -556,12 +652,18 @@ def _deterministic_evaluate_rule(
         rule_signals = rule.get("signals", [])
         raw_yaml = rule.get("yaml_definition", "")
 
+        # NEW: defer RULE-001 so attack-specific rules keep precedence.
+        if rule_id == "RULE-001":
+            continue
+
         matched_detected: List[str] = []
 
         # Check signal_exists
         for rs in rule_signals:
             if rs.lower() in signals_lower_map:
                 matched_detected.append(signals_lower_map[rs.lower()])
+            elif normalize_signal_id(rs) in signals_normalized_map:
+                matched_detected.append(signals_normalized_map[normalize_signal_id(rs)])
 
         # Check RULE-002 OWASP core attack signals
         if rule_id == "RULE-002" and matched_detected:
@@ -612,6 +714,25 @@ def _deterministic_evaluate_rule(
                 yaml_definition=raw_yaml,
             )
 
+    # NEW: RULE-001 malicious IP block. Reached only when no attack-specific or
+    # path-based rule matched above, i.e. the IP reputation hit is the sole
+    # threat in the request context.
+    if ip_threat_detected:
+        for rule in retrieved_rules:
+            if rule.get("rule_id") != "RULE-001":
+                continue
+            return WAFRuleMatchResult(
+                matched_rule_id="RULE-001",
+                action=rule.get("action", "BLOCK"),
+                detected_signals=sorted(set(ip_threat_detected)),
+                explanation=(
+                    f"The request originated from a flagged malicious IP "
+                    f"({', '.join(repr(s) for s in sorted(set(ip_threat_detected)))}) "
+                    f"matching RULE-001 condition criteria."
+                ),
+                yaml_definition=rule.get("yaml_definition", ""),
+            )
+
     # Default fallback to first retrieved rule or RULE-002
     fallback_rule = retrieved_rules[0] if retrieved_rules else {}
     return WAFRuleMatchResult(
@@ -647,7 +768,17 @@ def evaluate_rule_agent(state: WAFState) -> Dict[str, Any]:
                         "Rules to follow:\n"
                         "1. If the request context contains OWASP attack signals (e.g., 'XSS', 'SQLI', 'Traversal', "
                         "'CMDEXE', 'Attack Tooling'), it matches RULE-002 ('OWASP Core Attack Prevention').\n"
-                        "2. Output the exact matched_rule_id ('RULE-002' for OWASP attacks).\n"
+                        # NEW: RULE-001 IP threat routing, with explicit precedence so
+                        # attack payloads still report their attack-specific rule.
+                        "1a. IP threat signals ('SITE-FLAGGED-IP', 'SIGSCI-IP', 'MALICIOUS-IP', "
+                        "'BLOCKLISTED-IP') indicate a flagged malicious client address and match "
+                        "RULE-001 ('Malicious and SigSci IP Block').\n"
+                        "1b. PRECEDENCE: attack-specific rules outrank RULE-001. If the request has BOTH an IP "
+                        "threat signal AND an attack signal (OWASP payload, sensitive path, or bot conditions), "
+                        "return the attack-specific rule (RULE-002/003/004), NOT RULE-001. Return RULE-001 only "
+                        "when an IP threat signal is the sole threat present.\n"
+                        "2. Output the exact matched_rule_id ('RULE-002' for OWASP attacks, 'RULE-001' for "
+                        "IP-reputation-only threats).\n"
                         "3. Output action: 'BLOCK'.\n"
                         "4. Output detected_signals: list of detected attack signals that triggered the rule (e.g. ['XSS', 'SQLI']).\n"
                         "5. Output explanation: concise description explaining the match, e.g. "
@@ -731,8 +862,21 @@ def process_waf_log(
     row_index: int = 0,
     rules_dir: str = "rules",
     vectorstore: Optional[QdrantClient] = None,
+    log_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Execute the end-to-end WAF agent pipeline for a specific CSV log row."""
+    """Execute the end-to-end WAF agent pipeline for a specific CSV log row.
+
+    Signal routing:
+    - OWASP attack signals -> RULE-002, sensitive paths -> RULE-003,
+      bot conditions on the login endpoint -> RULE-004.
+    - IP threat signals (`SITE-FLAGGED-IP`, `SIGSCI-IP`, `MALICIOUS-IP`,
+      `BLOCKLISTED-IP`) -> RULE-001, but only when the IP reputation hit is the
+      sole threat; attack-specific rules above take precedence otherwise.
+
+    Pass `log_context` to evaluate a synthetic request context directly instead
+    of reading a CSV row (useful for exercising IP-only RULE-001 routing, which
+    no row in the bundled CSV produces).
+    """
     if vectorstore is None:
         vectorstore = build_waf_rule_vectorstore(rules_dir=rules_dir)
 
@@ -743,6 +887,16 @@ def process_waf_log(
         "row_index": row_index,
         "vectorstore": vectorstore,
     }
+
+    # NEW: an explicit log_context short-circuits CSV reading in
+    # extract_log_context, so IP threat rows can be evaluated without a CSV.
+    if log_context is not None:
+        enriched = dict(log_context)
+        enriched.setdefault("signals", [])
+        enriched["ip_threat_signals"] = [
+            s for s in enriched["signals"] if is_ip_threat_signal(s)
+        ]
+        initial_state["log_context"] = enriched
 
     final_state = app.invoke(initial_state)
     return final_state.get("final_output", {})
