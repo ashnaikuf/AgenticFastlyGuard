@@ -429,10 +429,10 @@ def _render_chat(rules_dir: str, vectorstore: Optional[Any]) -> None:
         return
 
     history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="🧑‍💻"):
         st.markdown(question)
 
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar="⚡"):
         with st.spinner("Thinking..."):
             try:
                 reply = answer(
