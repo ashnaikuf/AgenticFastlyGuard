@@ -1,3 +1,8 @@
+TODO 
+Other uncovered signals, in case any should get rules: DATACENTER (343), PRIVATEFILE (243), FORCEFULBROWSING (48), CHALLENGE-TOKEN-INVALID (168), DOUBLEENCODING (71), CODEINJECTION (25), CVE-2025-* (12).
+
+==========================================
+
 I am building an Agentic RAG system that ingests Fastly Next-Gen WAF (SigSci) rule definitions from a Markdown file, embeds them into a vector store, and maps raw attack data (provided via a CSV file) to the appropriate WAF rule.
 
 Below is a raw sample of Fastly NG WAF rules:

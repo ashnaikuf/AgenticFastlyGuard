@@ -26,6 +26,12 @@ from waf_agent_pipeline import (
     run_waf_analysis,
     signal_ids,
 )
+from waf_chat_agent import WafChatContext, answer, build_chat_agent
+
+# Model used only to classify a question's scope before invoking the chat agent.
+# Set to "" to skip classification entirely and let the agent handle scope via
+# its system prompt, saving one LLM call per turn.
+CHAT_CLASSIFIER_MODEL = os.getenv("WAF_CHAT_CLASSIFIER_MODEL", "gpt-4o-mini")
 
 # Load environment configuration (.env)
 load_dotenv()
@@ -253,98 +259,203 @@ def main():
                 )
 
                 # Retain the full analysis for follow-up questions and reruns.
+                # The DataFrame is kept too: the chat tools aggregate over it on
+                # every turn, and each chat message triggers a Streamlit rerun,
+                # so re-parsing the CSV per question would be wasteful.
                 st.session_state["analysis"] = analysis
                 st.session_state["thread_id"] = analysis["thread_id"]
-
-                result = analysis["final_output"]
-
-                if not result:
-                    st.warning("Pipeline completed, but no rule match was returned.")
-                    return
-
-                matched_rule_id = result.get("matched_rule_id", "N/A")
-                action = result.get("action", "BLOCK")
-                detected_signals = result.get("detected_signals", [])
-                explanation = result.get("explanation", "")
-                yaml_definition = result.get("yaml_definition", "")
-                verified = result.get("verified", False)
-                verification_level = result.get("verification_level", "")
-                verification_notes = result.get("verification_notes", [])
-                evaluator = result.get("evaluator", "")
-
-                # No-match is a first-class outcome, not a failed analysis: it
-                # identifies traffic that needs a new rule authored.
-                if matched_rule_id == NO_RULE_MATCH:
-                    st.warning("⚠️ **NO RULE MATCH** — no indexed rule covers this request.")
-                    st.info(explanation)
-                    st.markdown(
-                        "**Next step:** author a rule covering the uncovered signals above, "
-                        "add it to `rules/`, then re-index from the sidebar."
-                    )
-                    return
-
-                # Success Notification
-                st.success(f"Analysis Complete! Matched Rule: **{matched_rule_id}** (Action: `{action}`)")
-
-                # Verification banner
-                if verified and verification_level == "verified":
-                    st.success(
-                        "✅ **Verified** — every reported signal is declared by the matched "
-                        "rule and present on the request, and all rule conditions were checked."
-                    )
-                elif verified and verification_level == "signals_verified":
-                    st.info(
-                        "☑️ **Signals verified** — reported signals are grounded in both the "
-                        "rule and the request. "
-                        + " ".join(verification_notes)
-                    )
-                else:
-                    st.error(
-                        "❌ **Unverified match** — the reported match contradicts the rule "
-                        "definition or the request log:"
-                    )
-                    for note in verification_notes:
-                        st.markdown(f"- {note}")
-
-                # Structured Summary Cards
-                res_col1, res_col2, res_col3 = st.columns(3)
-                with res_col1:
-                    st.metric("Matched Rule ID", matched_rule_id)
-                with res_col2:
-                    st.metric("Action", action)
-                with res_col3:
-                    st.metric("Triggering Signals", ", ".join(detected_signals) if detected_signals else "None")
-
-                # Explanation Block
-                st.markdown("### Explanation")
-                st.info(explanation)
-                if evaluator:
-                    st.caption(f"Evaluated by: {evaluator}")
-
-                # Signal provenance: which detector fired, where, and on what value
-                signal_details = (
-                    all_signal_details[int(row_index)]
-                    if int(row_index) < len(all_signal_details)
-                    else []
-                )
-                if signal_details:
-                    with st.expander("🔎 Signal Provenance (detector, location, value)"):
-                        st.dataframe(pd.DataFrame(signal_details), width="stretch")
-
-                # Raw YAML Condition Block
-                st.markdown("### Raw YAML Condition Block")
-                if yaml_definition:
-                    st.code(yaml_definition, language="yaml")
-                else:
-                    st.warning("No YAML condition definition returned.")
-
-                # Final Agent Structured JSON Output (matching main.py CLI output)
-                # st.markdown("### Final Agent Structured JSON Output")
-                # st.json(result)
+                st.session_state["log_df"] = df
+                st.session_state["log_name"] = source_filename
+                st.session_state["analysis_row"] = int(row_index)
+                # A new analysis starts a new conversation.
+                st.session_state["chat_history"] = []
+                st.session_state.pop("chat_agent", None)
 
             except Exception as e:
                 logger.exception("Error executing WAF agent pipeline: %s", e)
                 st.error(f"Error during WAF rule analysis: {e}")
+
+    # Render the current analysis, if any. NEW: reads from session state rather
+    # than only rendering inside the button block, so the results survive the
+    # rerun that every chat message triggers.
+    stored = st.session_state.get("analysis")
+    if stored:
+        if st.session_state.get("analysis_row") != int(row_index):
+            st.info(
+                f"Showing the analysis of row "
+                f"**{st.session_state.get('analysis_row')}**. Click "
+                f"**Analyze** to evaluate the currently selected row {row_index}."
+            )
+        _render_analysis(stored, all_signal_details)
+        st.divider()
+        _render_chat(rules_dir=rules_dir, vectorstore=vectorstore)
+
+
+def _render_analysis(
+    analysis: Dict[str, Any], all_signal_details: List[List[Dict[str, str]]]
+) -> None:
+    """Render a completed analysis: verification, summary, provenance, YAML."""
+    result = analysis.get("final_output") or {}
+    if not result:
+        st.warning("Pipeline completed, but no rule match was returned.")
+        return
+
+    row_index = (analysis.get("log_context") or {}).get("row_index", 0)
+
+    matched_rule_id = result.get("matched_rule_id", "N/A")
+    action = result.get("action", "BLOCK")
+    detected_signals = result.get("detected_signals", [])
+    explanation = result.get("explanation", "")
+    yaml_definition = result.get("yaml_definition", "")
+    verified = result.get("verified", False)
+    verification_level = result.get("verification_level", "")
+    verification_notes = result.get("verification_notes", [])
+    evaluator = result.get("evaluator", "")
+
+    # No-match is a first-class outcome, not a failed analysis: it identifies
+    # traffic that needs a new rule authored.
+    if matched_rule_id == NO_RULE_MATCH:
+        st.warning("⚠️ **NO RULE MATCH** — no indexed rule covers this request.")
+        st.info(explanation)
+        st.markdown(
+            "**Next step:** author a rule covering the uncovered signals above, "
+            "add it to `rules/`, then re-index from the sidebar."
+        )
+        return
+
+    # Success Notification
+    st.success(f"Analysis Complete! Matched Rule: **{matched_rule_id}** (Action: `{action}`)")
+
+    # Verification banner
+    if verified and verification_level == "verified":
+        st.success(
+            "✅ **Verified** — every reported signal is declared by the matched "
+            "rule and present on the request, and all rule conditions were checked."
+        )
+    elif verified and verification_level == "signals_verified":
+        st.info(
+            "☑️ **Signals verified** — reported signals are grounded in both the "
+            "rule and the request. " + " ".join(verification_notes)
+        )
+    else:
+        st.error(
+            "❌ **Unverified match** — the reported match contradicts the rule "
+            "definition or the request log:"
+        )
+        for note in verification_notes:
+            st.markdown(f"- {note}")
+
+    # Structured Summary Cards
+    res_col1, res_col2, res_col3 = st.columns(3)
+    with res_col1:
+        st.metric("Matched Rule ID", matched_rule_id)
+    with res_col2:
+        st.metric("Action", action)
+    with res_col3:
+        st.metric("Triggering Signals", ", ".join(detected_signals) if detected_signals else "None")
+
+    # Explanation Block
+    st.markdown("### Explanation")
+    st.info(explanation)
+    if evaluator:
+        st.caption(f"Evaluated by: {evaluator}")
+
+    # Signal provenance: which detector fired, where, and on what value
+    signal_details = (
+        all_signal_details[int(row_index)]
+        if int(row_index) < len(all_signal_details)
+        else []
+    )
+    if signal_details:
+        with st.expander("🔎 Signal Provenance (detector, location, value)"):
+            st.dataframe(pd.DataFrame(signal_details), width="stretch")
+
+    # Raw YAML Condition Block
+    st.markdown("### Raw YAML Condition Block")
+    if yaml_definition:
+        st.code(yaml_definition, language="yaml")
+    else:
+        st.warning("No YAML condition definition returned.")
+
+
+def _render_chat(rules_dir: str, vectorstore: Optional[Any]) -> None:
+    """Render the follow-up chat interface for the current analysis.
+
+    Depends on session state populated by the analysis run: the agent's tools
+    read the loaded DataFrame and the completed analysis, so there is nothing
+    useful to ask before an analysis exists.
+    """
+    st.subheader("4. Ask Follow-up Questions")
+
+    analysis = st.session_state.get("analysis")
+    log_df = st.session_state.get("log_df")
+    if analysis is None or log_df is None:
+        st.info("Run an analysis above to start asking questions about it.")
+        return
+
+    st.caption(
+        "Ask about this log file (counts, top values, examples), the indexed "
+        "WAF rules, or why this rule was recommended."
+    )
+
+    # Build the agent once per analysis and keep it in session state, so the
+    # conversation's checkpointed history survives Streamlit reruns.
+    if "chat_agent" not in st.session_state:
+        try:
+            context = WafChatContext(
+                df=log_df,
+                vectorstore=vectorstore,
+                analysis=analysis,
+                rules_dir=rules_dir,
+                csv_name=st.session_state.get("log_name", ""),
+            )
+            st.session_state["chat_agent"] = build_chat_agent(context)
+        except Exception as exc:
+            logger.exception("Could not initialize chat agent: %s", exc)
+            st.error(f"Chat is unavailable: {exc}")
+            return
+
+    history = st.session_state.setdefault("chat_history", [])
+
+    # Replay the conversation so far.
+    for turn in history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+            if turn.get("tools"):
+                st.caption(f"via {', '.join(turn['tools'])}")
+
+    question = st.chat_input("e.g. How many rows hit a SANS-flagged IP?")
+    if not question:
+        return
+
+    history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                reply = answer(
+                    st.session_state["chat_agent"],
+                    question,
+                    thread_id=st.session_state.get("thread_id", "waf-chat"),
+                    classifier_model=CHAT_CLASSIFIER_MODEL,
+                )
+            except Exception as exc:
+                logger.exception("Chat turn failed: %s", exc)
+                st.error(f"Could not answer that: {exc}")
+                history.pop()
+                return
+
+        st.markdown(reply["answer"])
+        if reply["tools_used"]:
+            st.caption(f"via {', '.join(reply['tools_used'])}")
+
+    history.append({
+        "role": "assistant",
+        "content": reply["answer"],
+        "tools": reply["tools_used"],
+    })
 
 
 if __name__ == "__main__":

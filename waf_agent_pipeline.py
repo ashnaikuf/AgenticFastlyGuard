@@ -678,7 +678,15 @@ def extract_signal_details_from_csv(csv_path: str) -> List[List[Dict[str, str]]]
     The detail-preserving counterpart of `extract_signals_from_csv`, which keeps
     returning bare ID lists for callers that only match on signal names.
     """
-    df = pd.read_csv(csv_path)
+    return extract_signal_details_from_dataframe(pd.read_csv(csv_path))
+
+
+def extract_signal_details_from_dataframe(df: Any) -> List[List[Dict[str, str]]]:
+    """Per-row signal details for an already-loaded DataFrame.
+
+    Lets callers holding a parsed log (the Streamlit app, the chat tools) avoid
+    re-reading the CSV while using exactly the same extraction logic.
+    """
     all_details: List[List[Dict[str, str]]] = []
 
     # NEW: read `summation` alongside `signals` so the blocklist flag is available.
