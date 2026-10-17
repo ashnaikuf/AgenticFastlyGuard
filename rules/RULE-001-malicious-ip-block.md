@@ -20,5 +20,5 @@ conditions:
       signals:
         - "Malicious IP"
         - "SigSci IP"
-        - "Suspected Bad Bot"
+        - "SANS"
 ```

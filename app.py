@@ -12,15 +12,19 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 from waf_agent_pipeline import (
+    NO_RULE_MATCH,
+    build_log_context,
     build_waf_rule_vectorstore,
-    extract_signals_from_csv,
-    process_waf_log,
+    extract_signal_details_from_csv,
+    run_waf_analysis,
+    signal_ids,
 )
 
 # Load environment configuration (.env)
@@ -143,9 +147,13 @@ def main():
     # Extract all signals in memory for overview
     active_buffer.seek(0)
     try:
-        all_signals = extract_signals_from_csv(active_buffer)
+        # Detail-preserving extraction: keeps each signal's detector/location/value
+        # for the provenance view, with IDs derived for the existing summaries.
+        all_signal_details = extract_signal_details_from_csv(active_buffer)
+        all_signals = [signal_ids(d) for d in all_signal_details]
     except Exception as err:
         logger.warning("Could not extract signals overview: %s", err)
+        all_signal_details = [[] for _ in range(total_rows)]
         all_signals = [[] for _ in range(total_rows)]
 
     # Metrics overview
@@ -227,16 +235,28 @@ def main():
 
         with st.spinner(f"Running LangGraph Agent Pipeline on Log Row #{row_index}..."):
             try:
-                # Reset buffer position before passing into process_waf_log
-                active_buffer.seek(0)
+                # Build the request context from the row already in memory. The
+                # pipeline is checkpointed, so state must stay serializable — an
+                # in-memory CSV buffer cannot be placed in it — and this also
+                # avoids re-parsing the whole CSV on every analysis.
+                log_context = build_log_context(selected_row, int(row_index))
 
-                # Process the log row directly using the in-memory buffer
-                result = process_waf_log(
-                    csv_path=active_buffer,
+                # A stable per-analysis thread_id keys this run's checkpoint, so
+                # follow-up questions can be answered against the same state.
+                thread_id = str(uuid4())
+                analysis = run_waf_analysis(
                     row_index=int(row_index),
                     rules_dir=rules_dir,
                     vectorstore=vectorstore,
+                    log_context=log_context,
+                    thread_id=thread_id,
                 )
+
+                # Retain the full analysis for follow-up questions and reruns.
+                st.session_state["analysis"] = analysis
+                st.session_state["thread_id"] = analysis["thread_id"]
+
+                result = analysis["final_output"]
 
                 if not result:
                     st.warning("Pipeline completed, but no rule match was returned.")
@@ -247,9 +267,44 @@ def main():
                 detected_signals = result.get("detected_signals", [])
                 explanation = result.get("explanation", "")
                 yaml_definition = result.get("yaml_definition", "")
+                verified = result.get("verified", False)
+                verification_level = result.get("verification_level", "")
+                verification_notes = result.get("verification_notes", [])
+                evaluator = result.get("evaluator", "")
+
+                # No-match is a first-class outcome, not a failed analysis: it
+                # identifies traffic that needs a new rule authored.
+                if matched_rule_id == NO_RULE_MATCH:
+                    st.warning("⚠️ **NO RULE MATCH** — no indexed rule covers this request.")
+                    st.info(explanation)
+                    st.markdown(
+                        "**Next step:** author a rule covering the uncovered signals above, "
+                        "add it to `rules/`, then re-index from the sidebar."
+                    )
+                    return
 
                 # Success Notification
                 st.success(f"Analysis Complete! Matched Rule: **{matched_rule_id}** (Action: `{action}`)")
+
+                # Verification banner
+                if verified and verification_level == "verified":
+                    st.success(
+                        "✅ **Verified** — every reported signal is declared by the matched "
+                        "rule and present on the request, and all rule conditions were checked."
+                    )
+                elif verified and verification_level == "signals_verified":
+                    st.info(
+                        "☑️ **Signals verified** — reported signals are grounded in both the "
+                        "rule and the request. "
+                        + " ".join(verification_notes)
+                    )
+                else:
+                    st.error(
+                        "❌ **Unverified match** — the reported match contradicts the rule "
+                        "definition or the request log:"
+                    )
+                    for note in verification_notes:
+                        st.markdown(f"- {note}")
 
                 # Structured Summary Cards
                 res_col1, res_col2, res_col3 = st.columns(3)
@@ -263,6 +318,18 @@ def main():
                 # Explanation Block
                 st.markdown("### Explanation")
                 st.info(explanation)
+                if evaluator:
+                    st.caption(f"Evaluated by: {evaluator}")
+
+                # Signal provenance: which detector fired, where, and on what value
+                signal_details = (
+                    all_signal_details[int(row_index)]
+                    if int(row_index) < len(all_signal_details)
+                    else []
+                )
+                if signal_details:
+                    with st.expander("🔎 Signal Provenance (detector, location, value)"):
+                        st.dataframe(pd.DataFrame(signal_details), width="stretch")
 
                 # Raw YAML Condition Block
                 st.markdown("### Raw YAML Condition Block")

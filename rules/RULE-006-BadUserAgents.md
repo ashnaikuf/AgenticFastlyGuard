@@ -1,7 +1,7 @@
-## Rule: RULE-005 - Bad User Agents Block
+## Rule: RULE-006 - Bad User Agents Block
 
 ### Metadata & Overview
-- **Rule ID**: `RULE-005`
+- **Rule ID**: `RULE-006`
 - **Rule Name**: Bad User Agents
 - **Target Domain**: Global / All Domains
 - **Action**: `BLOCK`
@@ -10,11 +10,17 @@
 
 ### Condition Logic
 ```yaml
-rule_id: RULE-005
+rule_id: RULE-006
 action: BLOCK
 conditions:
   operator: ANY
   rules:
+    - type: signal_exists
+      operator: ANY
+      signals:
+        - "ATTACK-TOOLING"
+        - "NOUA"
+        - "SUSPECTED-BAD-BOT"
     - type: user_agent_like
       match_type: wildcard
       value: "*curl*"
@@ -23,3 +29,4 @@ conditions:
         - "python"
         - "nmap"
         - "wpscan"
+```        

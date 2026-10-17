@@ -10,11 +10,11 @@ import json
 import logging
 import os
 import re
-from functools import lru_cache
+from functools import lru_cache, partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from typing_extensions import TypedDict
 
 import pandas as pd
@@ -29,6 +29,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 
 # LangGraph
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 # Load environment variables
@@ -40,12 +41,32 @@ logger = logging.getLogger("waf_agent_pipeline")
 # Pydantic Schemas & State Types
 # ==============================================================================
 
-class WAFRuleMatchResult(BaseModel):
-    """Structured output schema for WAF rule evaluation matching."""
+# Sentinel rule ID returned when no indexed rule covers the request context.
+# Preferred over silently reporting the highest-scoring retrieved rule, which
+# produces a confident-looking recommendation with no basis in the rule logic.
+NO_RULE_MATCH = "NO_RULE_MATCH"
+
+# Verification outcomes recorded on the final result by the `verify_match` node.
+VERIFY_FULL = "verified"            # every condition in the rule was machine-checked
+VERIFY_SIGNALS_ONLY = "signals_verified"  # signals checked; non-signal conditions were not
+VERIFY_FAILED = "failed"            # the reported match contradicts the rule or the log
+VERIFY_NO_MATCH = "no_match"        # NO_RULE_MATCH; nothing to verify
+
+
+class WAFRuleEvaluation(BaseModel):
+    """Structured output schema produced by the evaluator (LLM or deterministic).
+
+    Deliberately excludes the verification fields: the evaluator must not be
+    able to certify its own output. `verify_match` re-checks these claims
+    independently and emits a `WAFRuleMatchResult`.
+    """
 
     matched_rule_id: str = Field(
         ...,
-        description="The matched rule identifier, e.g., RULE-002",
+        description=(
+            "The matched rule identifier, e.g., RULE-002. Use 'NO_RULE_MATCH' "
+            "when no retrieved rule's conditions cover the request context."
+        ),
     )
     action: str = Field(
         ...,
@@ -65,15 +86,45 @@ class WAFRuleMatchResult(BaseModel):
     )
 
 
+class WAFRuleMatchResult(WAFRuleEvaluation):
+    """Final pipeline output: an evaluation plus its independent verification."""
+
+    verified: bool = Field(
+        default=False,
+        description="True when the reported match survived independent verification",
+    )
+    verification_level: str = Field(
+        default=VERIFY_FAILED,
+        description=(
+            "One of 'verified', 'signals_verified', 'failed', 'no_match'. "
+            "'signals_verified' means the rule declares conditions beyond "
+            "signal_exists that are not yet machine-checked."
+        ),
+    )
+    verification_notes: List[str] = Field(
+        default_factory=list,
+        description="Human-readable findings from verification; empty when fully verified",
+    )
+    evaluator: str = Field(
+        default="",
+        description="Which evaluator produced the match: 'llm' or 'deterministic'",
+    )
+
+
 class WAFState(TypedDict, total=False):
-    """State schema tracked across LangGraph nodes."""
+    """State schema tracked across LangGraph nodes.
+
+    NEW (Phase 4): the Qdrant client is deliberately NOT part of the state. The
+    graph is compiled with a checkpointer, which serializes state at every node
+    boundary, and a live client is not serializable. It is bound to the
+    retrieval node at graph construction time instead.
+    """
 
     csv_path: str
     row_index: int
     log_context: Dict[str, Any]
     retrieved_rules: List[Dict[str, Any]]
     final_output: Dict[str, Any]
-    vectorstore: Any
 
 
 # ==============================================================================
@@ -340,6 +391,13 @@ def build_waf_rule_vectorstore(
     return client
 
 
+# Number of rule candidates retrieval returns to the evaluator. The evaluator can
+# only match a rule that was retrieved, so this is a recall floor, not a tuning
+# knob: at the previous value of 4 against a 6-rule corpus, RULE-002 fell out of
+# the window on genuine SQLi rows and the match was silently fabricated instead.
+# Keep this at or above the rule count until hybrid retrieval and re-ranking land.
+RETRIEVAL_LIMIT = int(os.getenv("WAF_RETRIEVAL_LIMIT", "10"))
+
 # Payload fields the retrieval step filters on. Qdrant rejects a filtered query
 # with 400 ("Index required but not found") unless the field is indexed.
 FILTERABLE_PAYLOAD_FIELDS = ("metadata.action", "metadata.rule_id")
@@ -411,30 +469,88 @@ def delete_orphaned_rule_points(
 # Step 2: CSV Signal Extraction
 # ==============================================================================
 
-# --- IP threat signal support (RULE-001) -------------------------------------
-# Canonical IP reputation / blocklist signal tags that route to RULE-001.
-IP_THREAT_SIGNALS = {
-    "SITE-FLAGGED-IP",
-    "SIGSCI-IP",
-    "MALICIOUS-IP",
-    "BLOCKLISTED-IP",
-}
-
-# Attack-specific signals that must keep taking precedence over RULE-001, so an
-# IP-flagged request carrying a real payload still reports the attack rule.
-ATTACK_SIGNALS = {
-    "XSS",
-    "SQLI",
-    "TRAVERSAL",
-    "CMDEXE",
-    "CODEINJECTION",
-    "ATTACK-TOOLING",
-    "DOUBLEENCODING",
-    "ABNORMALPATH",
-}
+# --- Signal taxonomy (data-driven) -------------------------------------------
+# Categories live in rules/signal_categories.yaml rather than in Python. The
+# previous hardcoded sets had drifted from the log data: SANS and SUSPECTED-BOT
+# were absent from every category, so ~45% of requests_maliciousip.csv carried
+# no recognized threat and fell through to a blind fallback match.
+SIGNAL_CATEGORIES_FILENAME = "signal_categories.yaml"
 
 # Signals that carry no routing information on their own.
-GENERIC_SIGNALS = {"BLOCKED", "BOT-ANALYSIS"}
+CATEGORY_GENERIC = "generic"
+# Load-bearing for match precedence: see `_rule_match_precedence`.
+CATEGORY_IP_REPUTATION = "ip_reputation"
+
+
+@lru_cache(maxsize=None)
+def load_signal_categories(rules_dir: str = "rules") -> Dict[str, str]:
+    """Map every configured signal ID to its category name.
+
+    Returns a flat ``{normalized_signal_id: category}`` lookup. Missing or
+    unreadable config degrades to an empty map rather than raising: callers
+    treat an uncategorized signal as uncategorized, which `coverage_report`
+    surfaces instead of hiding.
+    """
+    config_path = Path(rules_dir) / SIGNAL_CATEGORIES_FILENAME
+    if not config_path.is_file():
+        logger.warning(
+            "Signal category config not found at %s; signals will be uncategorized.",
+            config_path,
+        )
+        return {}
+
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("Could not parse %s: %s", config_path, exc)
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for category, members in (config.get("categories") or {}).items():
+        for signal in members or []:
+            mapping[normalize_signal_id(signal)] = category
+    return mapping
+
+
+@lru_cache(maxsize=None)
+def _load_signal_prefixes(rules_dir: str = "rules") -> List[tuple]:
+    """Prefix fallbacks as ``(prefix, category)`` pairs, longest prefix first."""
+    config_path = Path(rules_dir) / SIGNAL_CATEGORIES_FILENAME
+    if not config_path.is_file():
+        return []
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    pairs = [
+        (normalize_signal_id(prefix), category)
+        for category, prefixes in (config.get("prefixes") or {}).items()
+        for prefix in prefixes or []
+    ]
+    return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
+
+
+def signal_category(signal: Any, rules_dir: str = "rules") -> str:
+    """Category of a signal, or "" when it is not covered by the config."""
+    normalized = normalize_signal_id(signal)
+    if not normalized:
+        return ""
+    direct = load_signal_categories(rules_dir).get(normalized)
+    if direct:
+        return direct
+    for prefix, category in _load_signal_prefixes(rules_dir):
+        if normalized.startswith(prefix):
+            return category
+    return ""
+
+
+def signals_in_category(category: str, rules_dir: str = "rules") -> Set[str]:
+    """All configured signal IDs belonging to ``category``."""
+    return {
+        signal
+        for signal, cat in load_signal_categories(rules_dir).items()
+        if cat == category
+    }
 
 
 def normalize_signal_id(raw: Any) -> str:
@@ -450,9 +566,17 @@ def normalize_signal_id(raw: Any) -> str:
     return re.sub(r"[\s_]+", "-", text).upper()
 
 
-def is_ip_threat_signal(signal: Any) -> bool:
-    """True when a signal denotes an IP reputation / blocklist threat (RULE-001)."""
-    return normalize_signal_id(signal) in IP_THREAT_SIGNALS
+def is_ip_threat_signal(signal: Any, rules_dir: str = "rules") -> bool:
+    """True when a signal denotes an IP reputation / blocklist threat.
+
+    Now resolved from the signal category config rather than a hardcoded set.
+    """
+    return signal_category(signal, rules_dir) == CATEGORY_IP_REPUTATION
+
+
+def is_generic_signal(signal: Any, rules_dir: str = "rules") -> bool:
+    """True when a signal carries no routing information on its own."""
+    return signal_category(signal, rules_dir) == CATEGORY_GENERIC
 
 
 def _summation_marks_blocklisted_ip(summation: Any) -> bool:
@@ -463,38 +587,74 @@ def _summation_marks_blocklisted_ip(summation: Any) -> bool:
     return bool(re.search(r'"blocklisted"\s*:\s*"?true"?', summation, re.IGNORECASE))
 
 
-def _extract_row_signals(signals_raw: Any, summation_raw: Any = None) -> List[str]:
-    """Parse one row's `signals` JSON, normalizing IP tags and de-duplicating.
+def _extract_row_signal_details(
+    signals_raw: Any, summation_raw: Any = None
+) -> List[Dict[str, str]]:
+    """Parse one row's `signals` JSON into detail dicts, de-duplicated by ID.
+
+    NEW: retains each signal's `location`, `value`, and `detector` alongside its
+    `id`. Fastly records an IP reputation hit as
+    ``{"id": "SANS", "location": "IP", "value": "205.210.31.135",
+    "detector": "SansRule"}``; keeping those fields lets verification sanity-check
+    the signal's scope and lets explanations name the offending value instead of
+    only the signal tag.
 
     Existing attack signal IDs (XSS, SQLI, ...) are preserved verbatim so that
     current OWASP and path-based rule evaluation is unaffected.
     """
-    row_signals: List[str] = []
+    details: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
     if pd.notna(signals_raw) and isinstance(signals_raw, str) and signals_raw.strip():
         try:
             parsed = json.loads(signals_raw)
             if isinstance(parsed, list):
                 for item in parsed:
-                    if isinstance(item, dict) and item.get("id"):
-                        signal_id = item["id"]
-                        # NEW: normalize IP-related IDs to canonical tags; all
-                        # other signal IDs keep their original spelling.
-                        if is_ip_threat_signal(signal_id):
-                            signal_id = normalize_signal_id(signal_id)
-                        if signal_id not in row_signals:
-                            row_signals.append(signal_id)
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    signal_id = item["id"]
+                    # Normalize IP-related IDs to canonical tags; all other
+                    # signal IDs keep their original spelling.
+                    if is_ip_threat_signal(signal_id):
+                        signal_id = normalize_signal_id(signal_id)
+                    if signal_id in seen:
+                        continue
+                    seen.add(signal_id)
+                    details.append({
+                        "id": signal_id,
+                        "location": str(item.get("location") or ""),
+                        "value": str(item.get("value") or ""),
+                        "detector": str(item.get("detector") or ""),
+                        "detector_scope": str(item.get("detector_scope") or ""),
+                    })
         except Exception as err:
             logger.debug("Failed parsing signals JSON: %s", err)
 
-    # NEW: fall back to the `summation` blocklist flag only when the row carries
-    # no explicit IP signal. `"blocklisted":"true"` is set on effectively every
+    # Fall back to the `summation` blocklist flag only when the row carries no
+    # explicit IP signal. `"blocklisted":"true"` is set on effectively every
     # logged request, so appending it unconditionally would mark all traffic as
     # an IP threat and starve the attack-specific rules.
-    if not any(is_ip_threat_signal(s) for s in row_signals):
+    if not any(is_ip_threat_signal(d["id"]) for d in details):
         if _summation_marks_blocklisted_ip(summation_raw):
-            row_signals.append("BLOCKLISTED-IP")
+            details.append({
+                "id": "BLOCKLISTED-IP",
+                "location": "IP",
+                "value": "",
+                "detector": "summation",
+                "detector_scope": "",
+            })
 
-    return row_signals
+    return details
+
+
+def signal_ids(details: List[Dict[str, str]]) -> List[str]:
+    """Flatten signal detail dicts back to the plain ID list used for matching."""
+    return [d["id"] for d in details]
+
+
+def _extract_row_signals(signals_raw: Any, summation_raw: Any = None) -> List[str]:
+    """Parse one row's `signals` JSON into a plain list of signal IDs."""
+    return signal_ids(_extract_row_signal_details(signals_raw, summation_raw))
 
 
 def extract_signals_from_csv(csv_path: str) -> List[List[str]]:
@@ -509,22 +669,61 @@ def extract_signals_from_csv(csv_path: str) -> List[List[str]]:
 
     Returns a list of detected signal IDs for each row.
     """
+    return [signal_ids(d) for d in extract_signal_details_from_csv(csv_path)]
+
+
+def extract_signal_details_from_csv(csv_path: str) -> List[List[Dict[str, str]]]:
+    """Per-row signal details (`id`, `location`, `value`, `detector`) for a CSV.
+
+    The detail-preserving counterpart of `extract_signals_from_csv`, which keeps
+    returning bare ID lists for callers that only match on signal names.
+    """
     df = pd.read_csv(csv_path)
-    all_signals: List[List[str]] = []
+    all_details: List[List[Dict[str, str]]] = []
 
     # NEW: read `summation` alongside `signals` so the blocklist flag is available.
     summations = df["summation"] if "summation" in df.columns else None
 
     for position, val in enumerate(df.get("signals", [])):
         summation_raw = summations.iloc[position] if summations is not None else None
-        all_signals.append(_extract_row_signals(val, summation_raw))
+        all_details.append(_extract_row_signal_details(val, summation_raw))
 
-    return all_signals
+    return all_details
 
 
 # ==============================================================================
 # Step 3: LangGraph Agent Pipeline
 # ==============================================================================
+
+def build_log_context(row: Any, row_index: int = 0) -> Dict[str, Any]:
+    """Build the request context the pipeline evaluates, from one CSV row.
+
+    Shared by `extract_log_context` and by callers that already hold the row
+    (the Streamlit app reads the CSV once into a DataFrame), so the context is
+    assembled in exactly one place and cannot drift between them.
+    """
+    # Shares `_extract_row_signal_details` with extract_signals_from_csv so IP
+    # tag normalization and the `summation` blocklist fallback apply identically.
+    signal_details = _extract_row_signal_details(row.get("signals"), row.get("summation"))
+    signals = signal_ids(signal_details)
+
+    return {
+        "signals": signals,
+        # Full signal records (location/value/detector) for verification and for
+        # explanations that can name the flagged value.
+        "signal_details": signal_details,
+        "path": str(row.get("path") or ""),
+        "domain": str(row.get("server_name") or row.get("server_hostname") or ""),
+        "method": str(row.get("method") or "GET"),
+        # NEW (Phase 3): required by the `user_agent_like` / `user_agent_equals`
+        # conditions, which were previously never evaluated.
+        "user_agent": str(row.get("user_agent") or ""),
+        "remote_ip": str(row.get("remote_ip") or ""),
+        "uri": str(row.get("uri") or ""),
+        "row_index": row_index,
+        "ip_threat_signals": [s for s in signals if is_ip_threat_signal(s)],
+    }
+
 
 def extract_log_context(state: WAFState) -> Dict[str, Any]:
     """Node: Reads CSV and extracts signals, path, domain, and HTTP method."""
@@ -538,55 +737,41 @@ def extract_log_context(state: WAFState) -> Dict[str, Any]:
     if row_index < 0 or row_index >= len(df):
         raise IndexError(f"row_index {row_index} out of bounds for CSV of length {len(df)}")
 
-    row = df.iloc[row_index]
-
-    # Parse signals for this row. NEW: shares `_extract_row_signals` with
-    # extract_signals_from_csv so IP tag normalization and the `summation`
-    # blocklist fallback apply identically here.
-    signals = _extract_row_signals(row.get("signals"), row.get("summation"))
-
-    domain = (
-        str(row.get("server_name") or row.get("server_hostname") or "")
-    )
-    path = str(row.get("path") or "")
-    method = str(row.get("method") or "GET")
-    uri = str(row.get("uri") or "")
-
-    log_context = {
-        "signals": signals,
-        "path": path,
-        "domain": domain,
-        "method": method,
-        "uri": uri,
-        "row_index": row_index,
-        # NEW: IP threat signals surfaced for RULE-001 routing downstream.
-        "ip_threat_signals": [s for s in signals if is_ip_threat_signal(s)],
-    }
-
-    return {"log_context": log_context}
+    return {"log_context": build_log_context(df.iloc[row_index], row_index)}
 
 
-def retrieve_waf_rules(state: WAFState) -> Dict[str, Any]:
-    """Node: Queries the vector store with extracted signals string and applies metadata filtering."""
+def retrieve_waf_rules(
+    state: WAFState, vectorstore: Optional[QdrantClient] = None
+) -> Dict[str, Any]:
+    """Node: Queries the vector store with extracted signals string and applies metadata filtering.
+
+    `vectorstore` is bound at graph construction time rather than read from
+    state, which must stay serializable for checkpointing.
+    """
     log_context = state.get("log_context", {})
     signals = log_context.get("signals", [])
     path = log_context.get("path", "")
 
-    vectorstore = state.get("vectorstore")
     if vectorstore is None:
         vectorstore = build_waf_rule_vectorstore()
 
     # Form query string from detected signals and request path.
     # NEW: IP threat tags are no longer stripped here (SITE-FLAGGED-IP used to be
     # discarded), so an IP-only request can still retrieve RULE-001.
-    query_terms = [s for s in signals if normalize_signal_id(s) not in GENERIC_SIGNALS]
+    query_terms = [s for s in signals if not is_generic_signal(s)]
     if not query_terms:
         query_terms = signals
 
     ip_threat_signals = [s for s in signals if is_ip_threat_signal(s)]
     query_str = f"Signals: {' '.join(query_terms)} Path: {path}"
-    if ip_threat_signals:
-        # NEW: add natural-language IP reputation terms so RULE-001's description
+    # NEW: only bias the query toward IP reputation when the IP hit is the *sole*
+    # indicator. Appending it whenever any IP signal was present polluted nearly
+    # every query — SITE-FLAGGED-IP rides along on 991/1000 rows of
+    # requests_sqli_xss_cmdexe.csv — which pushed RULE-002 out of the result
+    # window for genuine SQLi/XSS rows.
+    non_ip_terms = [s for s in query_terms if not is_ip_threat_signal(s)]
+    if ip_threat_signals and not non_ip_terms:
+        # Natural-language IP reputation terms so RULE-001's description
         # ("malicious IP", "reputation", "blocklist") scores well semantically.
         query_str += " Malicious IP reputation blocklist flagged client address"
 
@@ -606,7 +791,7 @@ def retrieve_waf_rules(state: WAFState) -> Dict[str, Any]:
                 )
             ]
         ),
-        limit=4,
+        limit=RETRIEVAL_LIMIT,
         with_payload=True,
     )
 
@@ -625,122 +810,295 @@ def retrieve_waf_rules(state: WAFState) -> Dict[str, Any]:
     return {"retrieved_rules": retrieved_rules}
 
 
+# ==============================================================================
+# Step 3b: Data-driven condition evaluation
+# ==============================================================================
+
+# Condition types the evaluator understands. A rule declaring anything outside
+# this set is reported as unevaluable rather than silently treated as matched.
+SUPPORTED_CONDITION_TYPES = {
+    "signal_exists",
+    "path_contains",
+    "path_equals",
+    "method_equals",
+    "user_agent_like",
+    "user_agent_equals",
+}
+
+# Rule-level `type:` values that cannot be decided from a single request.
+STATEFUL_RULE_TYPES = {"rate_limit"}
+
+
+class ConditionOutcome(BaseModel):
+    """Result of evaluating one rule's conditions against one request."""
+
+    matched: bool = False
+    matched_signals: List[str] = Field(default_factory=list)
+    # Human-readable reasons each satisfied condition passed, for explanations.
+    reasons: List[str] = Field(default_factory=list)
+    # Condition types present in the rule that this evaluator cannot decide.
+    unevaluable: List[str] = Field(default_factory=list)
+    # True when the rule's conditions hold but the action depends on state
+    # (request rate) that a single log row cannot establish.
+    stateful_gate: str = ""
+
+
+def _as_list(value: Any) -> List[str]:
+    """Normalize a YAML `value`/`values` field to a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _wildcard_matches(pattern: str, text: str) -> bool:
+    """Case-insensitive `*` wildcard match, as used by `user_agent_like`."""
+    regex = "^" + ".*".join(re.escape(part) for part in pattern.split("*")) + "$"
+    return bool(re.match(regex, text, re.IGNORECASE))
+
+
+def _evaluate_condition(
+    condition: Dict[str, Any], log_context: Dict[str, Any]
+) -> tuple:
+    """Evaluate a single condition.
+
+    Returns ``(matched, matched_signals, reason, unevaluable_type)``.
+    """
+    ctype = condition.get("type", "")
+    path = str(log_context.get("path") or "")
+    method = str(log_context.get("method") or "")
+    user_agent = str(log_context.get("user_agent") or "")
+    signals = log_context.get("signals") or []
+
+    if ctype == "signal_exists":
+        declared = {normalize_signal_id(s) for s in _as_list(condition.get("signals"))}
+        present = {normalize_signal_id(s): s for s in signals}
+        hits = sorted(present[n] for n in declared & set(present))
+        # `operator` governs ANY vs ALL across the declared signals.
+        operator = str(condition.get("operator", "ANY")).upper()
+        if operator == "ALL":
+            matched = bool(declared) and declared <= set(present)
+        else:
+            matched = bool(hits)
+        reason = (
+            f"signal_exists({operator}) satisfied by {', '.join(repr(h) for h in hits)}"
+            if matched else ""
+        )
+        return matched, hits, reason, ""
+
+    if ctype == "path_contains":
+        needles = _as_list(condition.get("values") or condition.get("value"))
+        hit = next((n for n in needles if n and n in path), "")
+        return bool(hit), [], (f"path {path!r} contains {hit!r}" if hit else ""), ""
+
+    if ctype == "path_equals":
+        wanted = _as_list(condition.get("value") or condition.get("values"))
+        matched = path in wanted
+        return matched, [], (f"path equals {path!r}" if matched else ""), ""
+
+    if ctype == "method_equals":
+        wanted = [m.upper() for m in _as_list(condition.get("value") or condition.get("values"))]
+        matched = method.upper() in wanted
+        return matched, [], (f"method is {method!r}" if matched else ""), ""
+
+    if ctype == "user_agent_equals":
+        wanted = [u.lower() for u in _as_list(condition.get("values") or condition.get("value"))]
+        matched = user_agent.lower() in wanted
+        return matched, [], (f"user_agent equals {user_agent!r}" if matched else ""), ""
+
+    if ctype == "user_agent_like":
+        patterns = _as_list(condition.get("value") or condition.get("values"))
+        hit = next((p for p in patterns if _wildcard_matches(p, user_agent)), "")
+        return bool(hit), [], (f"user_agent {user_agent!r} matches {hit!r}" if hit else ""), ""
+
+    # Unknown condition type: report it rather than defaulting either way.
+    return False, [], "", ctype or "unknown"
+
+
+def evaluate_rule_conditions(
+    rule: Dict[str, Any], log_context: Dict[str, Any]
+) -> ConditionOutcome:
+    """Evaluate a rule's YAML conditions against a request context.
+
+    Replaces the per-rule ``if rule_id == "RULE-00X"`` ladder that hardcoded
+    domains, paths, and signal lists in Python while the same facts were already
+    declared in the rule YAML. Honors the ``conditions.operator`` ALL/ANY
+    combinator and the rule-level ``domain`` scope.
+    """
+    raw_yaml = rule.get("yaml_definition", "")
+    if not raw_yaml:
+        return ConditionOutcome(unevaluable=["missing_yaml"])
+
+    try:
+        parsed = yaml.safe_load(raw_yaml)
+    except Exception as exc:
+        logger.warning("Could not parse YAML for %s: %s", rule.get("rule_id"), exc)
+        return ConditionOutcome(unevaluable=["unparseable_yaml"])
+    if not isinstance(parsed, dict):
+        return ConditionOutcome(unevaluable=["unparseable_yaml"])
+
+    # Rule-level domain scope (RULE-004 declares `domain:` outside `conditions`).
+    rule_domain = str(parsed.get("domain") or "")
+    if rule_domain and str(log_context.get("domain") or "") != rule_domain:
+        return ConditionOutcome(
+            matched=False,
+            reasons=[f"rule is scoped to domain {rule_domain!r}"],
+        )
+
+    conditions = parsed.get("conditions") or {}
+    condition_list = conditions.get("rules") if isinstance(conditions, dict) else None
+    if not isinstance(condition_list, list) or not condition_list:
+        return ConditionOutcome(unevaluable=["no_conditions"])
+
+    operator = str(conditions.get("operator", "ALL")).upper()
+
+    results: List[bool] = []
+    matched_signals: List[str] = []
+    reasons: List[str] = []
+    unevaluable: List[str] = []
+
+    for condition in condition_list:
+        if not isinstance(condition, dict):
+            continue
+        matched, hits, reason, unknown = _evaluate_condition(condition, log_context)
+        if unknown:
+            unevaluable.append(unknown)
+            continue
+        results.append(matched)
+        if matched:
+            matched_signals.extend(hits)
+            if reason:
+                reasons.append(reason)
+
+    if not results:
+        return ConditionOutcome(unevaluable=unevaluable or ["no_evaluable_conditions"])
+
+    matched = all(results) if operator == "ALL" else any(results)
+
+    # An ALL rule containing an unevaluable condition cannot be confirmed.
+    if matched and operator == "ALL" and unevaluable:
+        matched = False
+
+    # Rate-limit rules describe a threshold over many requests; a single row can
+    # satisfy the conditions but never establish that the limit was exceeded.
+    stateful_gate = ""
+    if matched and str(parsed.get("type") or "") in STATEFUL_RULE_TYPES:
+        stateful_gate = str(parsed.get("type"))
+
+    return ConditionOutcome(
+        matched=matched,
+        matched_signals=sorted(set(matched_signals)),
+        reasons=reasons,
+        unevaluable=sorted(set(unevaluable)),
+        stateful_gate=stateful_gate,
+    )
+
+
+def _rule_match_precedence(outcome: ConditionOutcome) -> int:
+    """Sort key deciding which matching rule to report (lower wins).
+
+    Generalizes the previous hardcoded ``if rule_id == "RULE-001": continue``:
+    a rule that matched *only* on IP reputation signals yields to any rule that
+    matched on other grounds, so a blocklisted IP carrying a real payload still
+    reports the attack-specific rule.
+    """
+    if outcome.stateful_gate:
+        # Conditions hold but the action depends on request rate; prefer a rule
+        # that can be confirmed from this request alone.
+        return 2
+    if outcome.matched_signals and all(
+        is_ip_threat_signal(s) for s in outcome.matched_signals
+    ):
+        return 1
+    return 0
+
+
 def _deterministic_evaluate_rule(
     retrieved_rules: List[Dict[str, Any]],
     log_context: Dict[str, Any],
-) -> WAFRuleMatchResult:
-    """Deterministic fallback evaluator verifying WAF rule condition logic.
+) -> WAFRuleEvaluation:
+    """Deterministic evaluator: match a request against retrieved rule conditions.
+
+    NEW (Phase 3): evaluates each rule's YAML conditions via
+    `evaluate_rule_conditions` instead of the previous per-rule
+    ``if rule_id == "RULE-00X"`` ladder, which hardcoded sensitive paths, the
+    RULE-004 domain, and RULE-001's deferral in Python while the same facts were
+    already declared in the rule files. Adding a rule no longer requires a code
+    change, and `user_agent_*` conditions are now honored.
 
     Ensures predictable behavior and tests without requiring live external API keys.
     """
     signals = log_context.get("signals", [])
-    signals_lower_map = {s.lower(): s for s in signals}
-    # NEW: normalized lookup so rule YAML spellings ("SigSci IP", "Malicious IP")
-    # match the log's canonical tags ("SIGSCI-IP", "MALICIOUS-IP").
-    signals_normalized_map = {normalize_signal_id(s): s for s in signals}
     path = log_context.get("path", "")
-    domain = log_context.get("domain", "")
 
-    # NEW: IP threat detection for RULE-001. Evaluated only after the
-    # attack-specific rules below, so a blocklisted IP that also carries an XSS
-    # or SQLi payload still reports the attack rule.
-    ip_threat_detected = [s for s in signals if is_ip_threat_signal(s)]
-
+    # Evaluate every retrieved rule, then pick among the matches by precedence
+    # rather than by retrieval rank.
+    matches: List[tuple] = []
     for rule in retrieved_rules:
-        rule_id = rule.get("rule_id")
-        action = rule.get("action", "BLOCK")
-        rule_signals = rule.get("signals", [])
-        raw_yaml = rule.get("yaml_definition", "")
+        outcome = evaluate_rule_conditions(rule, log_context)
+        if outcome.matched:
+            matches.append((_rule_match_precedence(outcome), rule, outcome))
 
-        # NEW: defer RULE-001 so attack-specific rules keep precedence.
-        if rule_id == "RULE-001":
-            continue
+    if matches:
+        matches.sort(key=lambda m: m[0])
+        _, rule, outcome = matches[0]
+        rule_id = rule.get("rule_id", "")
+        reason_text = "; ".join(outcome.reasons) if outcome.reasons else "conditions satisfied"
 
-        matched_detected: List[str] = []
-
-        # Check signal_exists
-        for rs in rule_signals:
-            if rs.lower() in signals_lower_map:
-                matched_detected.append(signals_lower_map[rs.lower()])
-            elif normalize_signal_id(rs) in signals_normalized_map:
-                matched_detected.append(signals_normalized_map[normalize_signal_id(rs)])
-
-        # Check RULE-002 OWASP core attack signals
-        if rule_id == "RULE-002" and matched_detected:
-            # Sort or prioritize recognizable OWASP signal names
-            matched_detected = sorted(list(set(matched_detected)))
-            explanation = (
-                f"The request contained OWASP attack signals ({', '.join(repr(s) for s in matched_detected)}) "
-                f"matching {rule_id} condition criteria."
+        explanation = f"{rule_id} matched: {reason_text}."
+        if outcome.stateful_gate:
+            explanation += (
+                f" Note: {rule_id} is a {outcome.stateful_gate} rule — its conditions "
+                "hold for this request, but the configured threshold is evaluated "
+                "across many requests and cannot be confirmed from a single log row."
             )
-            return WAFRuleMatchResult(
-                matched_rule_id=rule_id,
-                action=action,
-                detected_signals=matched_detected,
-                explanation=explanation,
-                yaml_definition=raw_yaml,
-            )
-
-        # Check RULE-003 path_contains
-        if rule_id == "RULE-003":
-            sensitive_paths = ["/.env", "/etc/passwd", "/profile/image/url"]
-            if any(sp in path for sp in sensitive_paths):
-                return WAFRuleMatchResult(
-                    matched_rule_id=rule_id,
-                    action=action,
-                    detected_signals=matched_detected,
-                    explanation=f"The request path '{path}' contains sensitive target paths matching RULE-003.",
-                    yaml_definition=raw_yaml,
-                )
-
-        # Check RULE-004 domain + path + bot signals
-        if rule_id == "RULE-004":
-            if domain == "dimensionash26.secureedge.xyz" and path == "/login" and matched_detected:
-                return WAFRuleMatchResult(
-                    matched_rule_id=rule_id,
-                    action=action,
-                    detected_signals=matched_detected,
-                    explanation=f"Request to sensitive endpoint {domain}{path} matched bot signal conditions in RULE-004.",
-                    yaml_definition=raw_yaml,
-                )
-
-        # General signal_exists match
-        if matched_detected:
-            return WAFRuleMatchResult(
-                matched_rule_id=rule_id,
-                action=action,
-                detected_signals=matched_detected,
-                explanation=f"Request signals matched {rule_id} condition criteria.",
-                yaml_definition=raw_yaml,
-            )
-
-    # NEW: RULE-001 malicious IP block. Reached only when no attack-specific or
-    # path-based rule matched above, i.e. the IP reputation hit is the sole
-    # threat in the request context.
-    if ip_threat_detected:
-        for rule in retrieved_rules:
-            if rule.get("rule_id") != "RULE-001":
-                continue
-            return WAFRuleMatchResult(
-                matched_rule_id="RULE-001",
-                action=rule.get("action", "BLOCK"),
-                detected_signals=sorted(set(ip_threat_detected)),
-                explanation=(
-                    f"The request originated from a flagged malicious IP "
-                    f"({', '.join(repr(s) for s in sorted(set(ip_threat_detected)))}) "
-                    f"matching RULE-001 condition criteria."
+        if outcome.matched_signals and all(
+            is_ip_threat_signal(s) for s in outcome.matched_signals
+        ):
+            # Name the flagged address when the signal detail carries it.
+            details = {d.get("id"): d for d in (log_context.get("signal_details") or [])}
+            flagged = next(
+                (
+                    details[s].get("value")
+                    for s in outcome.matched_signals
+                    if details.get(s) and details[s].get("value")
                 ),
-                yaml_definition=rule.get("yaml_definition", ""),
+                "",
             )
+            if flagged:
+                explanation = (
+                    f"{rule_id} matched: client address {flagged} is flagged by "
+                    f"{', '.join(repr(s) for s in outcome.matched_signals)}."
+                )
 
-    # Default fallback to first retrieved rule or RULE-002
-    fallback_rule = retrieved_rules[0] if retrieved_rules else {}
-    return WAFRuleMatchResult(
-        matched_rule_id=fallback_rule.get("rule_id", "RULE-002"),
-        action=fallback_rule.get("action", "BLOCK"),
-        detected_signals=[s for s in signals if s.upper() in {"XSS", "SQLI", "TRAVERSAL", "CMDEXE"}],
-        explanation="Request evaluated against WAF rules.",
-        yaml_definition=fallback_rule.get("yaml_definition", ""),
+        return WAFRuleEvaluation(
+            matched_rule_id=rule_id,
+            action=rule.get("action", "BLOCK"),
+            detected_signals=outcome.matched_signals,
+            explanation=explanation,
+            yaml_definition=rule.get("yaml_definition", ""),
+        )
+
+    # No rule's conditions covered this request. Previously this returned
+    # `retrieved_rules[0]` (or RULE-002) with the explanation "Request evaluated
+    # against WAF rules." — a confident recommendation chosen by retrieval
+    # ranking rather than by any condition actually matching. Reporting the gap
+    # is the useful answer: it identifies traffic needing a new rule.
+    candidates = ", ".join(
+        f"{r.get('rule_id')}" for r in retrieved_rules if r.get("rule_id")
+    ) or "none"
+    return WAFRuleEvaluation(
+        matched_rule_id=NO_RULE_MATCH,
+        action="NONE",
+        detected_signals=[],
+        explanation=(
+            f"No indexed WAF rule covers this request. Signals present: "
+            f"{', '.join(signals) if signals else 'none'}. "
+            f"Path: '{path}'. Closest retrieved candidates: {candidates}. "
+            "Consider authoring a rule for these signals."
+        ),
+        yaml_definition="",
     )
 
 
@@ -756,7 +1114,7 @@ def evaluate_rule_agent(state: WAFState) -> Dict[str, Any]:
             from langchain_openai import ChatOpenAI
 
             llm = ChatOpenAI(model="gpt-4o", temperature=0)
-            structured_llm = llm.with_structured_output(WAFRuleMatchResult)
+            structured_llm = llm.with_structured_output(WAFRuleEvaluation)
 
             prompt = ChatPromptTemplate.from_messages([
                 (
@@ -783,7 +1141,19 @@ def evaluate_rule_agent(state: WAFState) -> Dict[str, Any]:
                         "4. Output detected_signals: list of detected attack signals that triggered the rule (e.g. ['XSS', 'SQLI']).\n"
                         "5. Output explanation: concise description explaining the match, e.g. "
                         "\"The request contained OWASP attack signals ('XSS') matching RULE-002 condition criteria.\"\n"
-                        "6. Output yaml_definition: the raw YAML block from the matched rule definition."
+                        "6. Output yaml_definition: the raw YAML block from the matched rule definition.\n"
+                        # NEW: an explicit no-match option. Without this the model
+                        # is forced to name some rule, which produced matches that
+                        # cited signals the rule did not contain.
+                        "7. GROUNDING: every signal you list in detected_signals MUST appear verbatim "
+                        "in the request's Signals list AND in the matched rule's signals list. Signal "
+                        "names are exact identifiers, not descriptions: 'SUSPECTED-BOT' and "
+                        "'SUSPECTED-BAD-BOT' are different detectors and must never be treated as "
+                        "equivalent.\n"
+                        "8. NO MATCH: if no retrieved rule's conditions are satisfied by the request "
+                        "context, set matched_rule_id to 'NO_RULE_MATCH', action to 'NONE', "
+                        "detected_signals to [], and explain which signals are uncovered. Do NOT pick "
+                        "the closest-looking rule."
                     ),
                 ),
                 (
@@ -811,7 +1181,7 @@ def evaluate_rule_agent(state: WAFState) -> Dict[str, Any]:
             rules_text = "\n".join(rules_text_parts)
 
             chain = prompt | structured_llm
-            result: WAFRuleMatchResult = chain.invoke({
+            result: WAFRuleEvaluation = chain.invoke({
                 "method": log_context.get("method", "GET"),
                 "domain": log_context.get("domain", ""),
                 "path": log_context.get("path", ""),
@@ -826,35 +1196,366 @@ def evaluate_rule_agent(state: WAFState) -> Dict[str, Any]:
                         result.yaml_definition = r.get("yaml_definition", "")
                         break
 
-            return {"final_output": result.model_dump()}
+            # NEW: tag provenance so `verify_match` can fall back to the
+            # deterministic evaluator when an LLM match fails verification.
+            return {"final_output": {**result.model_dump(), "evaluator": "llm"}}
 
         except Exception as e:
             logger.warning("ChatOpenAI execution encountered error (%s); using deterministic evaluation.", e)
 
     # Deterministic fallback evaluation
     result = _deterministic_evaluate_rule(retrieved_rules, log_context)
-    return {"final_output": result.model_dump()}
+    return {"final_output": {**result.model_dump(), "evaluator": "deterministic"}}
 
 
-def create_waf_pipeline(vectorstore: Optional[QdrantClient] = None) -> Any:
+# ==============================================================================
+# Step 4: Independent Verification
+# ==============================================================================
+
+def _rule_condition_types(raw_yaml: str) -> List[str]:
+    """Condition types declared by a rule's YAML, e.g. ['signal_exists', 'path_contains']."""
+    if not raw_yaml:
+        return []
+    try:
+        parsed = yaml.safe_load(raw_yaml)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    conditions = parsed.get("conditions") or {}
+    rules_list = conditions.get("rules") if isinstance(conditions, dict) else None
+    if not isinstance(rules_list, list):
+        return []
+    return [r.get("type", "") for r in rules_list if isinstance(r, dict)]
+
+
+def _verify_evaluation(
+    evaluation: Dict[str, Any],
+    retrieved_rules: List[Dict[str, Any]],
+    log_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Independently re-check a reported match. Pure assertions, no LLM calls.
+
+    Catches the failure mode where the evaluator reports a fluent, confident
+    match citing a signal that the rule does not contain or that the request
+    never carried.
+
+    Returns the ``verified`` / ``verification_level`` / ``verification_notes``
+    fields to merge onto the evaluation.
+    """
+    rule_id = evaluation.get("matched_rule_id", "")
+    detected = evaluation.get("detected_signals") or []
+    notes: List[str] = []
+
+    if rule_id == NO_RULE_MATCH:
+        return {
+            "verified": True,
+            "verification_level": VERIFY_NO_MATCH,
+            "verification_notes": ["No rule claimed; nothing to verify."],
+        }
+
+    # Check 1: the reported rule must be one that retrieval actually returned.
+    matched_rule = next(
+        (r for r in retrieved_rules if r.get("rule_id") == rule_id), None
+    )
+    if matched_rule is None:
+        available = ", ".join(r.get("rule_id", "?") for r in retrieved_rules) or "none"
+        return {
+            "verified": False,
+            "verification_level": VERIFY_FAILED,
+            "verification_notes": [
+                f"Rule {rule_id!r} was not among the retrieved rules ({available}); "
+                "it may be hallucinated."
+            ],
+        }
+
+    rule_signals = {normalize_signal_id(s) for s in (matched_rule.get("signals") or [])}
+    log_signals = {normalize_signal_id(s) for s in (log_context.get("signals") or [])}
+
+    # Check 2: every cited signal must belong to the matched rule.
+    for sig in detected:
+        if normalize_signal_id(sig) not in rule_signals:
+            notes.append(
+                f"Signal {sig!r} is not declared by {rule_id} "
+                f"(rule declares: {sorted(rule_signals) or 'none'})."
+            )
+
+    # Check 3: every cited signal must actually be present on the request.
+    for sig in detected:
+        if normalize_signal_id(sig) not in log_signals:
+            notes.append(f"Signal {sig!r} is not present in the request's signals.")
+
+    # Check 4: a signal-based rule reported as matched must cite the signal that
+    # triggered it. An empty list is the signature of the old blind fallback.
+    if rule_signals and not detected:
+        notes.append(
+            f"{rule_id} matches on signals but no triggering signal was reported."
+        )
+
+    # Check 5 (informational): an IP reputation signal should be IP-scoped.
+    details = {d.get("id"): d for d in (log_context.get("signal_details") or [])}
+    for sig in detected:
+        detail = details.get(sig)
+        if detail and is_ip_threat_signal(sig):
+            location = detail.get("location", "")
+            if location and location.upper() != "IP":
+                notes.append(
+                    f"IP reputation signal {sig!r} has unexpected location "
+                    f"{location!r} (expected 'IP')."
+                )
+
+    # Check 6 (NEW, Phase 3): independently re-evaluate the rule's own declared
+    # conditions against the request. Previously only signal membership was
+    # checked, which passed a RULE-004 match on a request that failed RULE-004's
+    # domain and path conditions.
+    outcome = evaluate_rule_conditions(matched_rule, log_context)
+    if outcome.unevaluable:
+        notes.append(
+            f"{rule_id} declares conditions this evaluator cannot decide: "
+            f"{', '.join(outcome.unevaluable)}."
+        )
+    elif not outcome.matched:
+        detail = "; ".join(outcome.reasons) if outcome.reasons else "no condition was satisfied"
+        notes.append(
+            f"{rule_id}'s declared conditions are not satisfied by this request "
+            f"({detail})."
+        )
+
+    if notes:
+        return {
+            "verified": False,
+            "verification_level": VERIFY_FAILED,
+            "verification_notes": notes,
+        }
+
+    # A rate-limit rule's conditions hold, but its threshold spans many requests
+    # and cannot be confirmed from one log row.
+    if outcome.stateful_gate:
+        return {
+            "verified": True,
+            "verification_level": VERIFY_SIGNALS_ONLY,
+            "verification_notes": [
+                f"Conditions verified. {rule_id} is a {outcome.stateful_gate} rule; "
+                "its threshold spans multiple requests and is not confirmable from "
+                "a single log row."
+            ],
+        }
+
+    return {
+        "verified": True,
+        "verification_level": VERIFY_FULL,
+        "verification_notes": [],
+    }
+
+
+def rule_signal_vocabulary(rules_dir: str = "rules") -> Dict[str, List[str]]:
+    """Map each rule ID to the normalized signals it declares, read from the files.
+
+    Derived from the rule Markdown rather than from a Python constant, so the
+    vocabulary cannot drift from the rules the pipeline actually indexes.
+    """
+    vocabulary: Dict[str, List[str]] = {}
+    for md_file in sorted(Path(rules_dir).glob("RULE-*.md")):
+        for rule_id, raw_yaml in extract_yaml_blocks_by_rule(
+            md_file.read_text(encoding="utf-8")
+        ).items():
+            try:
+                parsed = yaml.safe_load(raw_yaml) or {}
+            except Exception:
+                continue
+            resolved_id = parsed.get("rule_id", rule_id)
+            conditions = parsed.get("conditions") or {}
+            condition_list = conditions.get("rules") if isinstance(conditions, dict) else []
+            declared = [
+                normalize_signal_id(s)
+                for condition in (condition_list or [])
+                if isinstance(condition, dict)
+                for s in _as_list(condition.get("signals"))
+            ]
+            vocabulary[resolved_id] = sorted(set(declared))
+    return vocabulary
+
+
+def coverage_report(csv_path: str, rules_dir: str = "rules") -> Dict[str, Any]:
+    """Diagnose which log signals no indexed rule covers.
+
+    Answers "which traffic can this rule set not explain?" — the question that
+    matters when the pipeline is used to decide what rule to write next. A signal
+    is *covered* when some rule declares it; a row is *covered* when at least one
+    of its signals is.
+    """
+    vocabulary = rule_signal_vocabulary(rules_dir)
+    owned = {s for declared in vocabulary.values() for s in declared}
+
+    details_by_row = extract_signal_details_from_csv(csv_path)
+
+    signal_counts: Dict[str, int] = {}
+    uncovered_counts: Dict[str, int] = {}
+    uncategorized: Dict[str, int] = {}
+    rows_uncovered = 0
+
+    for row_details in details_by_row:
+        row_signals = {normalize_signal_id(d["id"]) for d in row_details}
+        for signal in row_signals:
+            signal_counts[signal] = signal_counts.get(signal, 0) + 1
+            if signal not in owned:
+                uncovered_counts[signal] = uncovered_counts.get(signal, 0) + 1
+            if not signal_category(signal, rules_dir):
+                uncategorized[signal] = uncategorized.get(signal, 0) + 1
+        if not (row_signals & owned):
+            rows_uncovered += 1
+
+    return {
+        "total_rows": len(details_by_row),
+        "rows_with_no_covered_signal": rows_uncovered,
+        "signal_counts": dict(sorted(signal_counts.items(), key=lambda kv: -kv[1])),
+        # Signals seen in the logs that no rule declares: candidates for a new rule.
+        "uncovered_signals": dict(sorted(uncovered_counts.items(), key=lambda kv: -kv[1])),
+        # Signals missing from signal_categories.yaml: taxonomy gaps.
+        "uncategorized_signals": dict(sorted(uncategorized.items(), key=lambda kv: -kv[1])),
+        "rule_signal_vocabulary": vocabulary,
+    }
+
+
+def verify_match(state: WAFState) -> Dict[str, Any]:
+    """Node: verify the evaluator's claim; substitute deterministic result on failure.
+
+    When an LLM match fails verification the deterministic evaluator is re-run
+    and used instead if it verifies, so a hallucinated match degrades to a
+    grounded one rather than reaching the user.
+    """
+    evaluation = dict(state.get("final_output") or {})
+    retrieved_rules = state.get("retrieved_rules", [])
+    log_context = state.get("log_context", {})
+
+    verification = _verify_evaluation(evaluation, retrieved_rules, log_context)
+
+    if not verification["verified"] and evaluation.get("evaluator") == "llm":
+        logger.warning(
+            "LLM match %r failed verification (%s); re-evaluating deterministically.",
+            evaluation.get("matched_rule_id"),
+            "; ".join(verification["verification_notes"]),
+        )
+        rejected_id = evaluation.get("matched_rule_id")
+        rejected_notes = verification["verification_notes"]
+
+        fallback = _deterministic_evaluate_rule(retrieved_rules, log_context).model_dump()
+        fallback["evaluator"] = "deterministic (LLM match rejected)"
+        fallback_verification = _verify_evaluation(
+            fallback, retrieved_rules, log_context
+        )
+        fallback_verification["verification_notes"] = [
+            f"Rejected LLM match {rejected_id!r}: {note}" for note in rejected_notes
+        ] + fallback_verification["verification_notes"]
+        return {"final_output": {**fallback, **fallback_verification}}
+
+    return {"final_output": {**evaluation, **verification}}
+
+
+def create_waf_pipeline(
+    vectorstore: Optional[QdrantClient] = None,
+    checkpointer: Optional[Any] = None,
+) -> Any:
     """Build and compile the LangGraph workflow.
 
     Workflow:
-    START -> extract_log_context -> retrieve_waf_rules -> evaluate_rule_agent -> END
+    START -> extract_log_context -> retrieve_waf_rules -> evaluate_rule_agent
+          -> verify_match -> END
+
+    NEW (Phase 4): compiles with a checkpointer so each analysis is persisted
+    under a ``thread_id``. This is what lets a later conversational layer answer
+    follow-up questions about an earlier analysis, and it gives every
+    recommendation a replayable audit trail. Pass ``checkpointer=False`` to
+    compile without one.
     """
     workflow = StateGraph(WAFState)
 
     workflow.add_node("extract_log_context", extract_log_context)
-    workflow.add_node("retrieve_waf_rules", retrieve_waf_rules)
+    # Bind the client to the node so it stays out of the serialized state.
+    workflow.add_node(
+        "retrieve_waf_rules",
+        partial(retrieve_waf_rules, vectorstore=vectorstore),
+    )
     workflow.add_node("evaluate_rule_agent", evaluate_rule_agent)
+    workflow.add_node("verify_match", verify_match)
 
     workflow.add_edge(START, "extract_log_context")
     workflow.add_edge("extract_log_context", "retrieve_waf_rules")
     workflow.add_edge("retrieve_waf_rules", "evaluate_rule_agent")
-    workflow.add_edge("evaluate_rule_agent", END)
+    workflow.add_edge("evaluate_rule_agent", "verify_match")
+    workflow.add_edge("verify_match", END)
 
-    app = workflow.compile()
-    return app
+    if checkpointer is False:
+        return workflow.compile()
+    if checkpointer is None:
+        checkpointer = MemorySaver()
+    return workflow.compile(checkpointer=checkpointer)
+
+
+def run_waf_analysis(
+    csv_path: str = "requests_sqli_xss_cmdexe.csv",
+    row_index: int = 0,
+    rules_dir: str = "rules",
+    vectorstore: Optional[QdrantClient] = None,
+    log_context: Optional[Dict[str, Any]] = None,
+    thread_id: Optional[str] = None,
+    checkpointer: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run the pipeline and return the **complete** final state.
+
+    NEW (Phase 4): `process_waf_log` returns only ``final_output``, discarding
+    ``log_context`` and ``retrieved_rules`` — precisely the context a follow-up
+    question needs ("why this rule and not that one?", "what else did retrieval
+    consider?"). This returns everything, plus the ``thread_id`` the run was
+    checkpointed under.
+
+    Routing:
+    - A rule matches when its declared YAML conditions are satisfied; among
+      several matches, one matching only on IP reputation signals yields to any
+      rule matching on other grounds.
+    - When no rule's conditions are satisfied the result is ``NO_RULE_MATCH``
+      rather than the highest-scoring retrieved rule.
+
+    Pass `log_context` to evaluate a synthetic request context directly instead
+    of reading a CSV row.
+    """
+    if vectorstore is None:
+        vectorstore = build_waf_rule_vectorstore(rules_dir=rules_dir)
+
+    app = create_waf_pipeline(vectorstore=vectorstore, checkpointer=checkpointer)
+
+    initial_state: WAFState = {
+        "csv_path": csv_path,
+        "row_index": row_index,
+    }
+
+    # An explicit log_context short-circuits CSV reading in extract_log_context,
+    # so synthetic request contexts can be evaluated without a CSV.
+    if log_context is not None:
+        enriched = dict(log_context)
+        enriched.setdefault("signals", [])
+        enriched.setdefault("signal_details", [])
+        enriched["ip_threat_signals"] = [
+            s for s in enriched["signals"] if is_ip_threat_signal(s)
+        ]
+        initial_state["log_context"] = enriched
+
+    # A thread_id is required whenever the graph is compiled with a checkpointer.
+    resolved_thread_id = thread_id or str(uuid4())
+    config = (
+        None
+        if checkpointer is False
+        else {"configurable": {"thread_id": resolved_thread_id}}
+    )
+
+    final_state = app.invoke(initial_state, config=config)
+
+    return {
+        "thread_id": resolved_thread_id,
+        "final_output": final_state.get("final_output", {}),
+        "log_context": final_state.get("log_context", {}),
+        "retrieved_rules": final_state.get("retrieved_rules", []),
+    }
 
 
 def process_waf_log(
@@ -863,40 +1564,20 @@ def process_waf_log(
     rules_dir: str = "rules",
     vectorstore: Optional[QdrantClient] = None,
     log_context: Optional[Dict[str, Any]] = None,
+    thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute the end-to-end WAF agent pipeline for a specific CSV log row.
+    """Execute the pipeline for one log row and return just the match result.
 
-    Signal routing:
-    - OWASP attack signals -> RULE-002, sensitive paths -> RULE-003,
-      bot conditions on the login endpoint -> RULE-004.
-    - IP threat signals (`SITE-FLAGGED-IP`, `SIGSCI-IP`, `MALICIOUS-IP`,
-      `BLOCKLISTED-IP`) -> RULE-001, but only when the IP reputation hit is the
-      sole threat; attack-specific rules above take precedence otherwise.
-
-    Pass `log_context` to evaluate a synthetic request context directly instead
-    of reading a CSV row (useful for exercising IP-only RULE-001 routing, which
-    no row in the bundled CSV produces).
+    Thin wrapper over `run_waf_analysis` preserving the original return shape
+    (the `final_output` dict alone) for existing callers. New code that needs
+    the retrieved candidates or the request context should call
+    `run_waf_analysis` directly.
     """
-    if vectorstore is None:
-        vectorstore = build_waf_rule_vectorstore(rules_dir=rules_dir)
-
-    app = create_waf_pipeline(vectorstore=vectorstore)
-
-    initial_state: WAFState = {
-        "csv_path": csv_path,
-        "row_index": row_index,
-        "vectorstore": vectorstore,
-    }
-
-    # NEW: an explicit log_context short-circuits CSV reading in
-    # extract_log_context, so IP threat rows can be evaluated without a CSV.
-    if log_context is not None:
-        enriched = dict(log_context)
-        enriched.setdefault("signals", [])
-        enriched["ip_threat_signals"] = [
-            s for s in enriched["signals"] if is_ip_threat_signal(s)
-        ]
-        initial_state["log_context"] = enriched
-
-    final_state = app.invoke(initial_state)
-    return final_state.get("final_output", {})
+    return run_waf_analysis(
+        csv_path=csv_path,
+        row_index=row_index,
+        rules_dir=rules_dir,
+        vectorstore=vectorstore,
+        log_context=log_context,
+        thread_id=thread_id,
+    )["final_output"]

@@ -1,0 +1,71 @@
+# Signal taxonomy for the Fastly Next-Gen WAF agent pipeline.
+#
+# Replaces the hardcoded IP_THREAT_SIGNALS / ATTACK_SIGNALS / GENERIC_SIGNALS
+# sets that previously lived in waf_agent_pipeline.py. Those drifted from the
+# real log data: SANS (467 rows) and SUSPECTED-BOT (748 rows) appeared in no
+# category, so the pipeline could not route them.
+#
+# Signal IDs are compared after normalization (upper-cased, whitespace and
+# underscores collapsed to hyphens), so "SigSci IP" and "SIGSCI-IP" match.
+#
+# Categories:
+#   ip_reputation - the client address itself is flagged. Load-bearing: a rule
+#                   matching only on these is evaluated *after* rules matching
+#                   on anything else, so a blocklisted IP carrying a real
+#                   payload still reports the attack-specific rule.
+#   attack        - evidence of an attack payload in the request.
+#   bot           - automation/bot indicators that are not payload evidence.
+#   auth          - authentication and credential-endpoint activity.
+#   generic       - carries no routing information on its own.
+
+categories:
+  ip_reputation:
+    - MALICIOUS-IP
+    - SIGSCI-IP
+    - SITE-FLAGGED-IP
+    - BLOCKLISTED-IP
+    # SANS/DShield blocklist. Logged with location="IP" and value set to the
+    # client address, exactly like the signals above.
+    - SANS
+
+  attack:
+    - XSS
+    - SQLI
+    - TRAVERSAL
+    - CMDEXE
+    - CODEINJECTION
+    - DOUBLEENCODING
+    - ABNORMALPATH
+    - ATTACK-TOOLING
+    - FORCEFULBROWSING
+    - PRIVATEFILE
+
+  bot:
+    - SUSPECTED-BOT
+    - SUSPECTED-BAD-BOT
+    - SUSPECTED-BAD-BOT-HEADLESS
+    - DATACENTER
+    - NOUA
+    - WRONG-API-CLIENT
+    - CHALLENGE-TOKEN-INVALID
+
+  auth:
+    - LOGINDISCOVERY
+    - LOGIN-DISCOVERY
+    - LOGINATTEMPT
+    - CLIENT-SIDE-COOKIE-VALID
+
+  generic:
+    - BLOCKED
+    - BOT-ANALYSIS
+    - HTTP403
+    - HTTP404
+    - HTTP503
+
+# Prefix rules applied when a signal ID matches no explicit entry above.
+# Keeps CVE detections categorized without enumerating every identifier.
+prefixes:
+  attack:
+    - CVE-
+  auth:
+    - SITE.LOGINATTEMPT
