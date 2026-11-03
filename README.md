@@ -283,45 +283,6 @@ conditions:
         - "CMDEXE"
         - "Attack Tooling"
 ```
-```
-
-### Supported Condition Types in Verification Engine
-- `signal_exists`: Checks for normalized Fastly security signals (e.g. `XSS`, `SQLI`, `SANS`, `SUSPECTED-BAD-BOT`).
-- `path_contains`: Substring match on requested URI path.
-- `user_agent_like`: Wildcard matching on the client `User-Agent` header (e.g. `*curl*`).
-- `user_agent_equals`: Exact string equality checks against known scanner signatures (`nmap`, `python`, `wpscan`).
-
----
-
-## Signal Taxonomy
-
-Normalized signal categories are defined in `rules/signal_categories.yaml`:
-- **`ip_reputation`**: Client IP reputation lists (`MALICIOUS-IP`, `SIGSCI-IP`, `SANS`, `BLOCKLISTED-IP`).
-- **`attack`**: Direct evidence of attack payloads (`SQLI`, `XSS`, `CMDEXE`, `TRAVERSAL`, `CVE-*`).
-- **`bot`**: Automation and bot tooling indicators (`SUSPECTED-BOT`, `SUSPECTED-BAD-BOT`, `NOUA`, `DATACENTER`).
-- **`auth`**: Authentication endpoints and credential events (`LOGINATTEMPT`, `LOGINDISCOVERY`).
-- **`generic`**: Telemetry signals without distinct threat categorization (`HTTP403`, `HTTP404`, `BLOCKED`).
-
----
-
-## Assessment Quiz
-
-Deepen your understanding of Agentic RAG, dense/sparse retrieval, and Fastly WAF architectures by exploring [`quiz.md`](quiz.md). It features multiple-choice and conceptual assessment questions covering:
-- Dense vs. Sparse retrieval (FAISS vs. BM25).
-- Two-stage retrieval and Cross-Encoder re-ranking safeguards.
-- LangGraph state serialization and memory checkpointing.
-- Verification guardrails and anti-hallucination design in automated security operations.
-
----
-
-## Video Reference & Further Reading
-
-- **Tech Talk Video**: [From Edge Telemetry to Automated Defense: Mining WAF Logs with Python](https://www.youtube.com/watch?v=dQw4w9WgXcQ)
-- **Fastly Next-Gen WAF Documentation**: [docs.fastly.com/en/ngwaf](https://docs.fastly.com/en/ngwaf)
-- **LangGraph Documentation**: [langchain-ai.github.io/langgraph](https://langchain-ai.github.io/langgraph/)
-- **Qdrant Vector Database**: [qdrant.tech/documentation](https://qdrant.tech/documentation/)
-
----
 
 ## License
 
